@@ -16,14 +16,14 @@
 # shared among all requestors. Via TCP this results in max 4
 # characters/sec. Via UDP this may be as high as
 # (max_size_of_udp_packet)*4. I don't deem this a flooding risk,
-# because you get the same Effect with icmp echo's. Nontheless this
+# because you get the same effect with icmp echo's. Nontheless this
 # may be switched off by commenting the two &udp_listen() lines below.
 #
 # It does dns lookups by default which will hang all replies while
 # looking up a hostname. This may be switched off, by setting $dns=0
 # below.
 #
-# $id$
+# $Id$
 
 require 5.002;
 
@@ -42,6 +42,9 @@ sub udp_packet;
 sub junk;
 sub logmsg;
 sub logconn;
+
+open(LOG,">>bigen.log") || die "Can't open logfile: $!";
+select LOG;$|=1; # Write everything into our LOG
 
 $SIG{'PIPE'}='dummy_sig_handler';
 
@@ -235,6 +238,7 @@ sub logconn {
 	}else{
 		$name=inet_ntoa($iaddr);
 	};
+	logmsg scalar localtime;
 	logmsg sprintf shift,$name,$port;
 };
 
