@@ -1,91 +1,96 @@
 #!/usr/local/bin/perl
-
-# $rcs$
-
+# vim:set ai ts=4 sw=4 si:
 #
-# This tries to implement RFC 3091: The Pi Digit Generation Protocol
+# This implements RFC 3091: The Pi Digit Generation Protocol
 #
-# We listen on Ports 314159 and 20007 TCP and UDP.
+# Written by Stefan `Sec` Zehl <sec@42.org>, 
+# first released under BSD Copyright 2001-5-1
+#
+# It implements the pigen and pigem (approximate pi) service via TCP
+# and UDP. The pigen service is done with a precalculated value of PI
+# read from the file "pi". If digits beyond the ones available are
+# requested, we violate the "SHOULD" provide an accurate value, and
+# return an approximation consisting of zeros.
+#
+# The service is deliberately slowed down to 4 Answers per second
+# shared among all requestors. Via TCP this results in max 4
+# characters/sec. Via UDP this may be as high as
+# (max_size_of_udp_packet)*4. I don't deem this a flooding risk,
+# because you get the same Effect with icmp echo's. Nontheless this
+# may be switched off by commenting the two &udp_listen() lines below.
+#
+# It does dns lookups by default which will hang all replies while
+# looking up a hostname. This may be switched off, by setting $dns=0
+# below.
+#
+# $id$
 
 require 5.002;
 
-#use strict;
-use Socket;
+$|=1;
 
-sub logmsg;
+use strict;
+use Socket;
+use Symbol qw(gensym);
+
 sub dummy_sig_handler;
 sub tcp_listen;
-sub udp;
+sub udp_listen;
+sub newconn;
+sub send;
+sub udp_packet;
+sub junk;
+sub logmsg;
+sub logconn;
 
-$SIG{'PIPE'}='sig_handler';
+$SIG{'PIPE'}='dummy_sig_handler';
 
+my $pi="141592653589793238462643383279502884197169399375105820974944".
+       "592307816406286208998628034825342117084"; # Fallback Approximation.
 
-$pi="3.1415926535897932384626433832795028841971693993751058209749445923078".
-"16406286208998628034825342117084";	# Fallback Approximation.
-
-if (-f pi){
+if (-f "pi"){
 	chomp($pi=`cat pi`);
+	logmsg length($pi)," digits of PI loaded";
 };
 
-$client=0; # global name for client handle.
+my $dns=1;						# Do DNS lookups (may cause delays).
+my (@listen,@conn,@port,@udp);	# Arrays for Socket handling.
+my (@offset);					# Array for Offset in tcp stream.
+my ($rin,$win,$ein);			# For select().
+my $client=0; 					# Global name for Socket handle.
 
-sub tcp_listen {
-	my $port=shift;
-	my $new = "CLIENT".$client++;
-	socket($new, PF_INET, SOCK_STREAM, getprotobyname("tcp"))
-														|| die "socket: $!";
-	bind  ($new, sockaddr_in($port, INADDR_ANY))        || die "bind: $!" ;
-	listen($new, SOMAXCONN)                             || die "listen: $!";
-	$listen[fileno($new)]=$new;
-	$port[fileno($new)]=$port;
-	vec($rin,fileno($new),1) = 1;
-};
-
-$rin = $win = $ein = '';
+# We listen on Ports 314159 and 20007 TCP and UDP.
 &tcp_listen(314159);
 &tcp_listen(220007);
-
-sub udp_listen {
-	my $port=shift;
-	my $new = "CLIENT".$client++;
-	socket($new, PF_INET, SOCK_DGRAM, getprotobyname("udp"))
-														|| die "socket: $!";
-	bind  ($new, sockaddr_in($port, INADDR_ANY))        || die "bind: $!" ;
-
-	$port[fileno($new)]=$port;
-	$udp[fileno($new)]=$new;
-	vec($rin,fileno($new),1) = 1;
-};
-&udp_listen(314159);
+&udp_listen(314159);			# Remove these, if you don't want UDP.
 &udp_listen(220007);
 
-print "Running.\n";
+logmsg "Started.";
 
-sub pb {
-	print unpack("b*",shift),"->",unpack("b*",shift)," ";
-}
+#sub pb { print unpack("b*",shift)." "; }
 
 while(1){
 	my $timeout=undef;
+	my $maxfd=1024;		# max FDs.
+
+	my ($nfound,$timeleft);
+	my ($rout,$wout,$eout);
 
 	$ein = $rin | $win;
 
 	($nfound,$timeleft) = select($rout=$rin, $wout=$win, $eout=$ein, $timeout);
-
-	pb($rin,$rout); pb($win,$wout); pb($ein,$eout);
-	print "$nfound , $timeleft\n";
+	
+#	pb($rin); pb($win); pb($ein);print"\n";
+#	pb($rout); pb($wout); pb($eout);print"$nfound\n";
 
 	die "nfound < 0: $!" if ($nfound < 0);
 
-	$maxfd=1024;
-	for (0..$maxfd){
+	for (0..$maxfd){ # Do what select deems necessary.
 		if (vec($eout,$_,1)==1){
-			print "execpt: $_\n";
 			die "Unhandled except on fd $_";
 			$nfound--;
 		};
 		if (vec($wout,$_,1)==1){
-			print "write: $_\n";
 			if ($conn[$_]){
 				&send($conn[$_]);
 			}else{
@@ -94,7 +99,6 @@ while(1){
 			$nfound--;
 		};
 		if (vec($rout,$_,1)==1){
-			print "read: $_\n";
 			if ($listen[$_]){
 				&newconn($listen[$_])
 			} elsif ($udp[$_]) {
@@ -114,23 +118,19 @@ while(1){
 
 exit;
 
-sub logmsg {
-	print @_,"\n";
-};
-
 sub newconn{
 	my $sock=shift;
-	my $new = "CLIENT".$client++;
+#	my $new = "CLIENT".$client++;
+	my $new = gensym;
+	my $paddr = accept($new,$sock);
 
-	$paddr = accept($new,$sock);
 	$conn[fileno($new)]=$new;
 	$port[fileno($new)]=$port[fileno($sock)];
+	$offset[fileno($new)]=0;
 	vec($rin,fileno($new),1) = 1;
 	vec($win,fileno($new),1) = 1;
 
-	my($port,$iaddr) = sockaddr_in($paddr);
-	my $name = gethostbyaddr($iaddr,AF_INET);
-	logmsg "connection from $name [". inet_ntoa($iaddr). "] port $port";
+	logconn $paddr,"Connection from %s port %d for $port[fileno($sock)]";
 };
 
 sub send{
@@ -138,25 +138,11 @@ sub send{
 	my $off=$offset[fileno($sock)];
 	my $data;
 
-	if($port[fileno($sock)] eq 314159 ){
-        # The method chosen SHOULD provide a precise value for the digits of Pi.
-		if($off<length($pi)){
-			$data=syswrite($sock,$pi,1,$off);
-		}else{ # If we can't, fall back to Zeros.
-			$data=syswrite($sock,"0",1);
-		};
-	} elsif ($port[fileno($sock)] eq 220007 ){
-		# Approximation service repeats itself.
-		$data=syswrite($sock,"142857",1,$off%6);
-	}else{
-		die "Unknown port number $port[fileno($sock)]";
-	};
-
-	$off+=$data;
+	$data=&digit($port[fileno($sock)],$off);
+	$off+=syswrite($sock,$data,1,0);
+	$offset[fileno($sock)]=$off;
 
 	select(undef, undef, undef, 0.25);
-
-	$offset[fileno($sock)]=$off;
 };
 
 sub udp_packet{
@@ -165,37 +151,22 @@ sub udp_packet{
 	my $hispaddr;
 	my $data;
 	
-	$hispaddr= recv($sock, $off, 512, 0);
+	$hispaddr= recv($sock, $data, 512, 0);
+	
+	$off=$data+0;
 
-	$off+=0; # Get numeric value
-
-	my($port,$iaddr) = sockaddr_in($hispaddr);
-	my $name = gethostbyaddr($iaddr,AF_INET);
-	logmsg "udp from $name [". inet_ntoa($iaddr). "] port $port";
+	logconn $hispaddr,"Udp $off from %s port %d";
 		
 	if($off==0){
-		print "Junked $off\n";
+		chomp($data);
+		logmsg "UDPjunk: $data";
 		return;
 	};
-	
-	$off--;
 
-	if($port[fileno($sock)] eq 314159 ){
-        # The method chosen SHOULD provide a precise value for the digits of Pi.
-		if($off<length($pi)){
-			$data=substr($pi,$off,1);
-		}else{ # If we can't, fall back to Zeros.
-			$data="0";
-		};
-	} elsif ($port[fileno($sock)] eq 220007 ){
-		# Approximation service repeats itself.
-		$data=substr("142857",$off%6,1);
-	}else{
-		die "Unknown port number $port[fileno($sock)]";
-	};
+	$data=&digit($port[fileno($sock)],$off-1);
 
-	defined(send($sock, $off.":".$data."\r\n", 0, $hispaddr)) || die "send $host: $!";
-
+	defined(send($sock, $off.":".$data."\r\n", 0, $hispaddr))
+												|| die "send: $!";
 	select(undef, undef, undef, 0.25);
 };
 
@@ -207,21 +178,86 @@ sub junk{
 	$data=sysread($sock,$read,1024);
 	
 	if ($data > 0){
-		print "Junked: $data bytes -$read- $!\n";
+		# If someone hits ^c in his Telnet, we get ff f4 ff fd 06
+		# We probably should do somthing about this, because telnet 
+		# then stops displaying the incoming data.
+		chomp($read);
+		logmsg "TCPjunk: $read";
 	}elsif ($data==0){
 		if ($! =~ /reset by peer/){ # XXX This is not nice.
 			vec($rin,fileno($sock),1) = 0;
 			vec($win,fileno($sock),1) = 0;
 			close($sock);
-			print "reset it\n";
+			logmsg "TCPClose";
 		};
 	}else{
-		die "Read returned undef, i think: $!";
+		die "Somewhat bizarre problem, i think: $!";
 	};
 };
 
 sub dummy_sig_handler {
         my($sig) = @_;
         logmsg "Caught a SIG$sig.";
+};
+
+sub tcp_listen {
+	my $port=shift;
+#	my $new = "CLIENT".$client++;
+	my $new = gensym;
+	socket($new, PF_INET, SOCK_STREAM, getprotobyname("tcp"))
+														|| die "socket: $!";
+	bind  ($new, sockaddr_in($port, INADDR_ANY))        || die "bind: $!" ;
+	listen($new, SOMAXCONN)                             || die "listen: $!";
+	$listen[fileno($new)]=$new;
+	$port[fileno($new)]=$port;
+	vec($rin,fileno($new),1) = 1;
+};
+
+sub udp_listen {
+	my $port=shift;
+#	my $new = "CLIENT".$client++;
+	my $new = gensym;
+
+	socket($new, PF_INET, SOCK_DGRAM, getprotobyname("udp"))
+														|| die "socket: $!";
+	bind  ($new, sockaddr_in($port, INADDR_ANY))        || die "bind: $!" ;
+
+	$port[fileno($new)]=$port;
+	$udp[fileno($new)]=$new;
+	vec($rin,fileno($new),1) = 1;
+};
+
+sub logconn {
+	my($port,$iaddr) = sockaddr_in(shift);
+	my $name;
+	if ($dns) {
+		$name = gethostbyaddr($iaddr,AF_INET)." [".inet_ntoa($iaddr)."]";
+	}else{
+		$name=inet_ntoa($iaddr);
+	};
+	logmsg sprintf shift,$name,$port;
+};
+
+sub digit{
+	my $port=shift;
+	my $off=shift;
+
+	if($port eq 314159 ){
+		# The method chosen SHOULD provide a precise value for the digits of Pi.
+		if($off<length($pi)){
+			return substr($pi,$off,1);
+		}else{ # If we can't, fall back to Zeros.
+			return "0";
+		};
+	} elsif ($port eq 220007 ){
+		# Approximation service repeats itself.
+		return substr("142857",$off%6,1);
+	}else{
+		die "Unknown port number $port";
+	};
+};
+
+sub logmsg {
+	print @_,"\n";
 };
 
