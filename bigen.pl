@@ -62,7 +62,7 @@ my (@offset);					# Array for Offset in tcp stream.
 my ($rin,$win,$ein);			# For select().
 my $client=0; 					# Global name for Socket handle.
 
-# We listen on Ports 314159 and 20007 TCP and UDP.
+# We listen on Ports 314159 and 220007 TCP and UDP.
 &tcp_listen(314159);
 &tcp_listen(220007);
 &udp_listen(314159);			# Remove these, if you don't want UDP.
